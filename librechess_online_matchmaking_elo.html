@@ -2123,9 +2123,10 @@ let timerInterval = null;
 let gameOver = false;
 let aiThinking = false;
 
-/* Reliable ICE / STUN configuration for cross-network WebRTC connections */
+/* Resilient Transport Layer: Uses PeerJS WebRTC when permitted by browser CSP/sandbox,
+   and automatically falls back to BroadcastChannel + localStorage event bus in sandboxed Canvas iframes */
 const PEER_CONFIG = {
-    debug: 1,
+    debug: 0,
     config: {
         iceServers: [
             { urls: 'stun:stun.l.google.com:19302' },
@@ -2140,6 +2141,205 @@ const PEER_CONFIG = {
 const PEER_PREFIX = 'librechess-room-v2-';
 const MM_PREFIX = 'librechess-mm-queue-';
 const MM_SLOTS_COUNT = 8;
+const LOCAL_BUS_CHANNEL = 'librechess_sandbox_net_v1';
+
+let isSandboxedWebSocketBlocked = false;
+
+function detectWebSocketRestriction() {
+    if (isSandboxedWebSocketBlocked) return true;
+    try {
+        if (typeof WebSocket === 'undefined') {
+            isSandboxedWebSocketBlocked = true;
+            return true;
+        }
+        // Probe whether sandboxed CSP blocks outbound wss:// connections
+        const testWs = new WebSocket('wss://0.peerjs.com:443/peerjs?key=peerjs&id=probe&token=probe&version=1.5.4');
+        testWs.onopen = () => { try { testWs.close(); } catch (e) {} };
+        testWs.onerror = () => { try { testWs.close(); } catch (e) {} };
+        return false;
+    } catch (err) {
+        isSandboxedWebSocketBlocked = true;
+        return true;
+    }
+}
+
+class LocalBusConnection {
+    constructor(bus, localId, remoteId) {
+        this.bus = bus;
+        this.localId = localId;
+        this.remoteId = remoteId;
+        this.open = true;
+        this.handlers = { open: [], data: [], close: [], error: [] };
+    }
+    on(event, fn) {
+        if (this.handlers[event]) this.handlers[event].push(fn);
+    }
+    emit(event, payload) {
+        if (this.handlers[event]) {
+            this.handlers[event].forEach(fn => {
+                try { fn(payload); } catch (e) {}
+            });
+        }
+    }
+    send(data) {
+        if (!this.open) return;
+        this.bus.postPacket({
+            kind: 'conn-data',
+            from: this.localId,
+            to: this.remoteId,
+            payload: data
+        });
+    }
+    close() {
+        if (!this.open) return;
+        this.open = false;
+        this.bus.postPacket({
+            kind: 'conn-close',
+            from: this.localId,
+            to: this.remoteId
+        });
+        this.emit('close');
+    }
+}
+
+class LocalBusPeer {
+    constructor(customId = null) {
+        this.id = customId || ('lc-local-' + Math.random().toString(36).slice(2, 10));
+        this.destroyed = false;
+        this.handlers = { open: [], connection: [], error: [] };
+        this.connections = new Map();
+        this.bc = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel(LOCAL_BUS_CHANNEL) : null;
+
+        this._onMessage = (raw) => {
+            if (this.destroyed || !raw || raw.to !== this.id) return;
+            if (raw.kind === 'conn-syn') {
+                if (this.connections.has(raw.from)) return;
+                const conn = new LocalBusConnection(this, this.id, raw.from);
+                this.connections.set(raw.from, conn);
+                this.postPacket({ kind: 'conn-ack', from: this.id, to: raw.from });
+                this.emit('connection', conn);
+                setTimeout(() => conn.emit('open'), 15);
+            } else if (raw.kind === 'conn-ack') {
+                const conn = this.connections.get(raw.from);
+                if (conn && !conn._openedEmitted) {
+                    conn._openedEmitted = true;
+                    conn.open = true;
+                    conn.emit('open');
+                }
+            } else if (raw.kind === 'conn-data') {
+                const conn = this.connections.get(raw.from);
+                if (conn && conn.open) {
+                    conn.emit('data', raw.payload);
+                }
+            } else if (raw.kind === 'conn-close') {
+                const conn = this.connections.get(raw.from);
+                if (conn) {
+                    conn.open = false;
+                    this.connections.delete(raw.from);
+                    conn.emit('close');
+                }
+            } else if (raw.kind === 'id-ping') {
+                this.postPacket({ kind: 'id-pong', from: this.id, to: raw.from });
+            } else if (raw.kind === 'id-pong' && this._pendingIdCheck) {
+                this._pendingIdCheck(true);
+            }
+        };
+
+        if (this.bc) {
+            this.bc.onmessage = (ev) => this._onMessage(ev.data);
+        }
+        this._storageListener = (ev) => {
+            if (ev.key === LOCAL_BUS_CHANNEL && ev.newValue) {
+                try {
+                    const parsed = JSON.parse(ev.newValue);
+                    this._onMessage(parsed.msg);
+                } catch (e) {}
+            }
+        };
+        window.addEventListener('storage', this._storageListener);
+
+        // Verify whether another tab already holds this custom ID
+        if (customId) {
+            let taken = false;
+            this._pendingIdCheck = (exists) => { if (exists) taken = true; };
+            this.postPacket({ kind: 'id-ping', from: 'probe-' + this.id, to: customId });
+            setTimeout(() => {
+                this._pendingIdCheck = null;
+                if (this.destroyed) return;
+                if (taken) {
+                    this.emit('error', { type: 'unavailable-id', message: 'ID already in use' });
+                } else {
+                    this.emit('open', this.id);
+                }
+            }, 120);
+        } else {
+            setTimeout(() => {
+                if (!this.destroyed) this.emit('open', this.id);
+            }, 30);
+        }
+    }
+
+    on(event, fn) {
+        if (this.handlers[event]) this.handlers[event].push(fn);
+    }
+
+    emit(event, payload) {
+        if (this.handlers[event]) {
+            this.handlers[event].forEach(fn => {
+                try { fn(payload); } catch (e) {}
+            });
+        }
+    }
+
+    postPacket(msg) {
+        if (this.bc) {
+            try { this.bc.postMessage(msg); } catch (e) {}
+        }
+        try {
+            localStorage.setItem(LOCAL_BUS_CHANNEL, JSON.stringify({ nonce: Math.random(), msg }));
+        } catch (e) {}
+    }
+
+    connect(remoteId) {
+        const conn = new LocalBusConnection(this, this.id, remoteId);
+        conn.open = false;
+        this.connections.set(remoteId, conn);
+        this.postPacket({ kind: 'conn-syn', from: this.id, to: remoteId });
+
+        setTimeout(() => {
+            if (!conn._openedEmitted && !this.destroyed) {
+                this.connections.delete(remoteId);
+                this.emit('error', { type: 'peer-unavailable', message: 'Peer not found' });
+                conn.emit('error', { type: 'peer-unavailable' });
+            }
+        }, 900);
+        return conn;
+    }
+
+    destroy() {
+        this.destroyed = true;
+        this.connections.forEach(c => { try { c.close(); } catch (e) {} });
+        this.connections.clear();
+        if (this.bc) {
+            try { this.bc.close(); } catch (e) {}
+        }
+        window.removeEventListener('storage', this._storageListener);
+    }
+}
+
+function createNetworkPeer(customId = null) {
+    if (detectWebSocketRestriction() || typeof Peer === 'undefined') {
+        isSandboxedWebSocketBlocked = true;
+        return new LocalBusPeer(customId);
+    }
+    try {
+        const p = customId ? new Peer(customId, PEER_CONFIG) : new Peer(PEER_CONFIG);
+        return p;
+    } catch (err) {
+        isSandboxedWebSocketBlocked = true;
+        return new LocalBusPeer(customId);
+    }
+}
 
 let peer = null;
 let peerConn = null;
@@ -2346,14 +2546,21 @@ async function startRealPlayerMatchmaking() {
     }, 1000);
 
     // Create an anonymous client peer first to probe existing occupied slots
-    const seekerPeer = new Peer(PEER_CONFIG);
+    const seekerPeer = createNetworkPeer();
     peer = seekerPeer;
 
     seekerPeer.on('error', (err) => {
         if (matchmakingState.cancelled || onlineState.connected) return;
+        const msg = String(err && (err.message || err.type || err));
+        if (msg.includes('SecurityError') || msg.includes('WebSocket') || err.type === 'network' || err.type === 'server-error') {
+            isSandboxedWebSocketBlocked = true;
+            try { seekerPeer.destroy(); } catch (e) {}
+            startRealPlayerMatchmaking();
+            return;
+        }
         // peer-unavailable is expected when probing empty slots
         if (err.type !== 'peer-unavailable') {
-            statusTitle.textContent = 'Reconnecting to matchmaking network...';
+            statusTitle.textContent = 'Scanning local & live matchmaking network...';
         }
     });
 
@@ -2466,7 +2673,7 @@ function claimMatchmakingHostSlot(tcSanitized, myName, attemptSlot) {
     }
 
     const slotPeerId = `${MM_PREFIX}${tcSanitized}-slot-${attemptSlot}`;
-    const hostPeer = new Peer(slotPeerId, PEER_CONFIG);
+    const hostPeer = createNetworkPeer(slotPeerId);
     peer = hostPeer;
 
     hostPeer.on('open', () => {
@@ -2533,6 +2740,13 @@ function claimMatchmakingHostSlot(tcSanitized, myName, attemptSlot) {
 
     hostPeer.on('error', (err) => {
         if (matchmakingState.cancelled || onlineState.connected) return;
+        const msg = String(err && (err.message || err.type || err));
+        if (msg.includes('SecurityError') || msg.includes('WebSocket')) {
+            isSandboxedWebSocketBlocked = true;
+            try { hostPeer.destroy(); } catch (e) {}
+            claimMatchmakingHostSlot(tcSanitized, myName, attemptSlot);
+            return;
+        }
         if (err.type === 'unavailable-id') {
             // Slot taken right as we claimed it -> try next slot
             try { hostPeer.destroy(); } catch (e) {}
@@ -2576,14 +2790,16 @@ function createOnlineRoom() {
     onlineState.roomCode = code;
     onlineState.myName = myName;
 
-    peer = new Peer(PEER_PREFIX + code, PEER_CONFIG);
+    peer = createNetworkPeer(PEER_PREFIX + code);
 
     peer.on('open', () => {
         createBtn.disabled = false;
         createBtn.textContent = 'Generate Room Code & Link';
         document.getElementById('generated-room-code').textContent = code;
         document.getElementById('host-room-info-box').classList.remove('hidden');
-        showToast(`Room ${code} ready! Share the code or invite link.`);
+        showToast(isSandboxedWebSocketBlocked
+            ? `Room ${code} ready (Sandbox Multi-Tab Mode)! Open another tab to join.`
+            : `Room ${code} ready! Share the code or invite link.`);
     });
 
     peer.on('connection', (conn) => {
@@ -2598,6 +2814,12 @@ function createOnlineRoom() {
     peer.on('error', (err) => {
         createBtn.disabled = false;
         createBtn.textContent = 'Generate Room Code & Link';
+        const msg = String(err && (err.message || err.type || err));
+        if (msg.includes('SecurityError') || msg.includes('WebSocket')) {
+            isSandboxedWebSocketBlocked = true;
+            createOnlineRoom();
+            return;
+        }
         if (err.type === 'unavailable-id') {
             createOnlineRoom();
         } else {
@@ -2630,7 +2852,7 @@ function joinOnlineRoom() {
     onlineState.roomCode = code;
     onlineState.myName = myName;
 
-    peer = new Peer(PEER_CONFIG);
+    peer = createNetworkPeer();
 
     let connectionTimeout = null;
 
@@ -2654,6 +2876,12 @@ function joinOnlineRoom() {
 
     peer.on('error', (err) => {
         if (connectionTimeout) clearTimeout(connectionTimeout);
+        const msg = String(err && (err.message || err.type || err));
+        if (msg.includes('SecurityError') || msg.includes('WebSocket')) {
+            isSandboxedWebSocketBlocked = true;
+            joinOnlineRoom();
+            return;
+        }
         joinBtn.disabled = false;
         joinBtn.textContent = 'Connect & Start Game';
         statusMsg.classList.remove('hidden');
